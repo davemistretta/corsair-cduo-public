@@ -1,12 +1,4 @@
-# Corsair Commander Duo — Linux hwmon Driver & GPU Fan Control
-
-## Overview
-
-This project provides a Linux kernel HID driver for the **Corsair Commander Duo** (USB VID=`0x1b1c`, PID=`0x0c56`) and a GPU-temperature-driven fan control service using `nvidia-smi` as the temperature source.
-
-The system exposes two temperature sensors and two fan RPM inputs via the Linux `hwmon` subsystem (`sensors`), and provides `pwm1`/`pwm2` sysfs attributes for fan speed control.
-
----
+# Corsair Commander Duo — Protocol & Driver Notes
 
 ## Hardware
 
@@ -16,33 +8,43 @@ The system exposes two temperature sensors and two fan RPM inputs via the Linux 
 | USB VID | `0x1b1c` |
 | USB PID | `0x0c56` |
 | HID interfaces | 2 — driver binds to interface 0 only |
-| Fans | 2 channels (only one fan connected in current setup) |
+| Fan headers | 2 channels |
 | Temp sensors | 2 channels |
 
 ---
 
-## Protocol (BRAGI variant, 64-byte HID reports)
+## Protocol (CommanderCore, 64-byte HID reports)
+
+The device uses the CommanderCore protocol with a single communication handle (`0xfc`). All sensor and control operations use an endpoint-based close/open/read or write/close cycle.
+
+### Command format
 
 ```
-OUT: [0x00][0x08][handle][opcode][prop][data...]   (report ID 0x00 + 64-byte payload)
+OUT: [0x00][0x08][handle][opcode][data...]   (report ID 0x00 + 64-byte payload)
 IN:  [0x00][handle][error][dtype][data...]
 ```
 
-### Handle init (opcode 0x03)
-```
-[0x08, h, 0x03, 0x00, 0x02]
-```
-Opens a handle. Some handles time out — that is expected and handled.
+### Handle operations
 
-### iCUE polling cycle (5 commands)
-```
-[08 0d 01 17] → [08 09 01 00] → [08 08 01 00] → [08 05 01 01] → [08 0d 01 21]
-```
-The `08 08 01 00` response alternates between:
-- **dtype `0x06`** — fan RPM data
-- **dtype `0x10`** — temperature data
+| Command | Bytes | Description |
+|---|---|---|
+| Enter software mode | `[08 01 03 00 02]` | Take control from hardware |
+| Enter hardware mode | `[08 01 03 00 01]` | Return control to hardware (sent on driver unload) |
+| Close endpoint | `[08 05 01 fc]` | Close current endpoint on handle 0xfc |
+| Open endpoint | `[08 0d fc <endpoint>]` | Open an endpoint for reading or writing |
+| Read endpoint | `[08 08 fc]` | Read data from currently open endpoint |
+| Write endpoint | `[08 06 fc <len_lo> <len_hi> 00 00 <dtype> <data...>]` | Write data to currently open endpoint |
+
+### Endpoints
+
+| Endpoint | Dtype | Direction | Description |
+|---|---|---|---|
+| `0x17` | `0x06` | Read | Fan RPM |
+| `0x21` | `0x10` | Read | Temperature |
+| `0x18` | `0x07` | Write | Fan speed control (per-channel, 0-100%) |
 
 ### Fan RPM data (dtype `0x06`)
+
 ```
 resp[5]         = fan count
 resp[6 + n*2]   = rpm_lo  (LE16)
@@ -50,174 +52,89 @@ resp[7 + n*2]   = rpm_hi
 ```
 
 ### Temperature data (dtype `0x10`)
+
 ```
 resp[5]         = sensor count
 resp[6 + n*3]   = status (0x00 = OK)
-resp[7 + n*3]   = temp_lo  (LE16, deci-°C)
+resp[7 + n*3]   = temp_lo  (LE16, deci-degrees C)
 resp[8 + n*3]   = temp_hi
 ```
-Convert: `raw * 100` → millidegrees C for hwmon.
 
-### Fan data location — critical
+Convert: `raw * 100` gives millidegrees C for hwmon.
 
-Fan RPM data appears in the **init buffer**, not just in polling cycles:
-1. The response to the `h=0x01` init command itself contains dtype `0x06`
-2. An **immediate `h=0x08` read** right after init also returns dtype `0x06`
+### Fan speed write (dtype `0x07`)
 
-These only appear on a **fresh HID session** (after USB replug or driver reload). The driver captures both explicitly in `csduo_reopen_handles()`.
+Per-channel addressing:
 
-### PWM write cycle (confirmed from pcap)
 ```
-[08 0d 01 18] → [08 09 01 00] → [08 06 01 07 00 00 00 07 00 01 00 00 <duty%>] → [08 05 01 01]
+[08 06 fc 07 00 00 00 07 00 01 <ch_id> 00 <duty%> 00]
 ```
-- `duty%` range: `0x00`–`0x64` (0–100%)
-- Linux hwmon uses 0–255; driver scales: `duty_pct = (val * 100) / 255`
-- **The device does not latch speed** — it reverts to default if commands stop. The driver uses a `delayed_work` to resend every 1 second.
+
+- `ch_id`: 0-based channel index
+- `duty%`: 0x00-0x64 (0-100%)
+- Linux hwmon uses 0-255; driver scales: `duty_pct = (val * 100) / 255`
+- The device latches the commanded speed; no continuous resend required.
+
+### Sensor read cycle
+
+Each sensor read follows a close-open-read-close pattern:
+
+```
+[08 05 01 fc]           close endpoint
+[08 0d fc <endpoint>]   open endpoint (0x17 for fans, 0x21 for temps)
+[08 08 fc]              read (retry until expected dtype appears)
+[08 05 01 fc]           close endpoint
+```
+
+The driver reads fan RPM and temperature in separate cycles, with up to 5 retries per read to handle dtype alternation.
 
 ---
 
 ## Driver Architecture (`corsair-cduo.c`)
 
-### Key design decisions
+### Design decisions
 
 | Decision | Rationale |
 |---|---|
-| Lazy init | Device is not polled until first `sensors` read |
-| `extra_groups` for PWM | `HWMON_CHANNEL_INFO(pwm, ...)` returns `-EINVAL` on kernel 6.8; custom sysfs attributes via `extra_groups` work correctly |
-| `pwm_active[]` flag | Tracks whether user has explicitly written a speed; avoids using a sentinel value like `255` that would conflict with valid 100% commands |
-| `delayed_work` | Resends active PWM commands every 1 second so the device maintains speed regardless of sensor polling frequency |
-| 4-cycle poll | Device alternates dtype on each cycle; up to 4 cycles ensures both fan and temp data are captured |
+| Lazy init | Device is not polled until first sensor read via sysfs |
+| 1-second cache | `csduo_ensure_fresh()` skips polling if data is < 1s old |
+| Per-channel PWM | Each fan independently addressable via channel ID in write command |
+| Hardware mode on remove | `csduo_remove()` sends EnterHardwareMode so device returns to default behavior |
+| `HWMON_PWM_INPUT` | Native hwmon PWM channel registration (no workarounds needed) |
+| Labels via `read_string` | `hwmon_ops.read_string` provides "Probe 1", "Fan 1", etc. |
 
-### struct csduo_data
-```c
-struct csduo_data {
-    struct hid_device *hdev;
-    struct device *hwmon_dev;
-    struct mutex lock;
-    struct completion wait_input;
-    struct delayed_work pwm_work;   /* periodic PWM refresh */
-    u8 *cmd_buffer;
-    u8 resp[PKT_LEN];
-    bool initialized;
-    unsigned long temp_updated;
-    long temp_cache[NUM_TEMPS];     /* millidegrees C */
-    bool temp_valid[NUM_TEMPS];
-    long fan_cache[NUM_FANS];       /* RPM */
-    bool fan_valid[NUM_FANS];
-    u8 pwm_cache[NUM_FANS];         /* last-written value, 0–255 */
-    bool pwm_active[NUM_FANS];      /* true once user has written a value */
-};
-```
-
-### sysfs files exposed (hwmon device)
+### sysfs attributes (hwmon)
 
 | File | Access | Description |
 |---|---|---|
-| `temp1_input` | r | Temperature sensor 1 (millidegrees C) |
-| `temp2_input` | r | Temperature sensor 2 |
-| `fan1_input` | r | Fan 1 RPM |
-| `fan2_input` | r | Fan 2 RPM |
-| `pwm1` | rw | Fan 1 PWM (0–255) |
-| `pwm2` | rw | Fan 2 PWM (0–255) |
-| `pwm1_enable` | rw | Always returns 1 (manual mode); writes accepted but ignored |
-| `pwm2_enable` | rw | Same |
+| `temp1_input` | RO | Temperature sensor 1 (millidegrees C) |
+| `temp2_input` | RO | Temperature sensor 2 |
+| `fan1_input` | RO | Fan 1 RPM |
+| `fan2_input` | RO | Fan 2 RPM |
+| `pwm1` | RW | Fan 1 duty cycle (0-255) |
+| `pwm2` | RW | Fan 2 duty cycle (0-255) |
+| `temp1_label` | RO | "Probe 1" |
+| `temp2_label` | RO | "Probe 2" |
+| `fan1_label` | RO | "Fan 1" |
+| `fan2_label` | RO | "Fan 2" |
 
-### Known issues / gotchas
-
-- **`HWMON_CHANNEL_INFO(pwm, ...)` causes `-EINVAL` on kernel 6.8.**
-  Root cause: kernel validates write callback at registration time.
-  Workaround: use `extra_groups` with `DEVICE_ATTR_RW` — works cleanly.
+### Known quirks
 
 - **Device state degrades after multiple `rmmod`/`insmod` without USB replug.**
-  Fan data stops appearing. Fix: unplug/replug Commander Duo. The driver correctly captures fan data on fresh sessions via the init buffer reads in `csduo_reopen_handles`.
-
-- **Device does not latch fan speed.**
-  iCUE sends speed commands continuously (~2 Hz). The driver replicates this with a `delayed_work` at 1 Hz.
-
-- **Both channels use the same PCap-confirmed command** (`07` bitmask in the fan command may target all fans). Individual channel control is implemented but untested with two fans connected.
+  Fan data may stop appearing. Fix: unplug/replug the Commander Duo USB connector.
 
 ---
 
-## GPU Fan Control Service (`csduo-fancontrol.py`)
+## Tested Kernels
 
-Uses `nvidia-smi` as the temperature source (GPU die temp, not exhaust sensor) and adjusts both fan channels on the same curve.
-
-### Fan curve
-
-| GPU Temp | PWM | Approx % |
+| Kernel | Distribution | Result |
 |---|---|---|
-| ≤ 30°C | 77 | 30% |
-| 40°C | 115 | 45% |
-| 50°C | 153 | 60% |
-| 55°C | 191 | 75% |
-| ≥ 65°C | 255 | 100% |
-
-Values between breakpoints are linearly interpolated. Edit the `CURVE` list in `/usr/local/bin/csduo-fancontrol.py` to adjust.
-
-### Why nvidia-smi instead of fancontrol?
-
-- `fancontrol` reads only hwmon sysfs — cannot read `nvidia-smi` directly
-- GPU exhaust sensors (Commander Duo temp1/temp2) have thermal lag vs. die temp
-- `nvidia-smi` gives actual GPU die temperature, more responsive for fan curves
-- Custom script is simpler and more flexible than `fancontrol` config for this use case
+| 6.8.0-106-generic | Ubuntu 24.04 | All features working |
+| 6.14.0-37-generic | Ubuntu 24.04 (HWE) | All features working |
 
 ---
 
-## Build & Deploy
+## References
 
-See `deploy.sh` in this directory. It handles everything from source.
-
-### Manual steps (for reference)
-
-```sh
-# On the target machine:
-cd ~/corsair-cduo
-make clean && make
-sudo insmod corsair-cduo.ko
-sudo dmesg | tail -5
-sensors
-```
-
-If fans show N/A: unplug/replug the Commander Duo USB, then `sudo insmod` again.
-
-### Driver auto-load on boot
-
-```sh
-cd ~/corsair-cduo
-sudo make install
-echo "corsair_cduo" | sudo tee /etc/modules-load.d/corsair-cduo.conf
-```
-
----
-
-## File Reference
-
-| File | Location | Purpose |
-|---|---|---|
-| `corsair-cduo.c` | `corsair-cduo/` | Kernel HID driver source |
-| `Makefile` | `corsair-cduo/` | Kernel module build |
-| `csduo-fancontrol.py` | `corsair-cduo/` (source) → `/usr/local/bin/` (installed) | GPU fan control script |
-| `csduo-fancontrol.service` | `corsair-cduo/` (source) → `/etc/systemd/system/` (installed) | systemd service unit |
-| `deploy.sh` | `corsair-cduo/` | One-shot build + install script |
-| `NOTES.md` | `corsair-cduo/` | This document |
-
-### Service management
-
-```sh
-sudo systemctl status csduo-fancontrol
-sudo systemctl restart csduo-fancontrol
-sudo journalctl -u csduo-fancontrol -f    # follow live output
-```
-
----
-
-## Python Test Scripts (development reference)
-
-| Script | Purpose |
-|---|---|
-| `duo_fan_confirm.py` | Confirmed fan speed control via hidraw (iCUE-continuous mode) |
-| `duo_fan_speed_raw.py` | Contains pcap-confirmed PWM command |
-| `duo_test.py` | Reveals fan data in init buffer (key protocol discovery) |
-| `duo_feature_probe.py` | HID feature report experiments |
-| `duo_usbreset_test.py` | USB reset + handle probe after reset |
-| `duo_fwreset_test.py` | Firmware reset + handle re-discovery |
+- [FanControl.CorsairLink](https://github.com/EvanMulawski/FanControl.CorsairLink) — CommanderCore protocol implementation (Windows/C#), primary protocol reference
+- [MisterZ42/corsair-cpro](https://github.com/MisterZ42/corsair-cpro) — Corsair Commander Pro Linux driver, original inspiration
