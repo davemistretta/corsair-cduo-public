@@ -40,6 +40,7 @@
  * The device latches commanded fan speeds; no continuous resend required.
  */
 
+#include <asm/unaligned.h>
 #include <linux/delay.h>
 #include <linux/hid.h>
 #include <linux/hwmon.h>
@@ -67,6 +68,18 @@
 #define EP_TEMPS	0x21
 #define EP_FAN_SPEED	0x18
 
+#define POLL_RETRY_COUNT	5	/* read_endpoint max retries */
+#define POLL_SLEEP_MS		50	/* ms between endpoint operations */
+#define INIT_SETTLE_MS		100	/* ms after entering software mode */
+#define INIT_RETRY_DELAY_MS	5000	/* ms before reattempting a failed init */
+
+/* Response byte offsets */
+#define RESP_ERR_OFF		2
+#define RESP_DTYPE_OFF		3
+#define RESP_COUNT_OFF		5
+#define RESP_FAN_DATA_OFF	6
+#define RESP_TEMP_DATA_OFF	6
+
 struct csduo_data {
 	struct hid_device *hdev;
 	struct device *hwmon_dev;
@@ -76,6 +89,7 @@ struct csduo_data {
 	u8 *cmd_buffer;  /* DMA-safe heap buffer, OUT_BUF_LEN bytes */
 	u8 resp[PKT_LEN];
 	bool initialized;
+	unsigned long init_last_fail; /* jiffies of last failed init attempt */
 	unsigned long temp_updated; /* jiffies of last poll cycle */
 	long temp_cache[NUM_TEMPS]; /* millidegrees */
 	bool temp_valid[NUM_TEMPS];
@@ -117,25 +131,6 @@ static const struct hwmon_channel_info * const csduo_info[] = {
 	NULL
 };
 
-static int csduo_read(struct device *dev, enum hwmon_sensor_types type,
-		      u32 attr, int channel, long *val);
-static int csduo_write(struct device *dev, enum hwmon_sensor_types type,
-		       u32 attr, int channel, long val);
-static int csduo_read_string(struct device *dev, enum hwmon_sensor_types type,
-			     u32 attr, int channel, const char **str);
-
-static const struct hwmon_ops csduo_hwmon_ops = {
-	.is_visible = csduo_is_visible,
-	.read = csduo_read,
-	.write = csduo_write,
-	.read_string = csduo_read_string,
-};
-
-static const struct hwmon_chip_info csduo_chip_info = {
-	.ops = &csduo_hwmon_ops,
-	.info = csduo_info,
-};
-
 /* Caller must hold priv->lock. Returns 0 on success, -ETIMEDOUT if no response. */
 static int csduo_send_recv(struct csduo_data *priv, const u8 *cmd, int len)
 {
@@ -160,7 +155,7 @@ static int csduo_send_recv(struct csduo_data *priv, const u8 *cmd, int len)
 
 	hid_dbg(priv->hdev,
 		"cmd [%02x %02x %02x %02x %02x] resp [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
-		cmd[0], len > 1 ? cmd[1] : 0, len > 2 ? cmd[2] : 0,
+		len > 0 ? cmd[0] : 0, len > 1 ? cmd[1] : 0, len > 2 ? cmd[2] : 0,
 		len > 3 ? cmd[3] : 0, len > 4 ? cmd[4] : 0,
 		priv->resp[0], priv->resp[1], priv->resp[2], priv->resp[3],
 		priv->resp[4], priv->resp[5], priv->resp[6], priv->resp[7],
@@ -205,9 +200,9 @@ static int csduo_read_endpoint(struct csduo_data *priv, u8 expected_dtype,
 		ret = csduo_send_recv(priv, cmd, sizeof(cmd));
 		if (ret)
 			return ret;
-		if (priv->resp[3] == expected_dtype)
+		if (priv->resp[RESP_DTYPE_OFF] == expected_dtype)
 			return 0;
-		msleep(50);
+		msleep(POLL_SLEEP_MS);
 	}
 
 	return -EIO;
@@ -222,15 +217,15 @@ static int csduo_read_sensor(struct csduo_data *priv, u8 endpoint,
 	int ret;
 
 	csduo_close_endpoint(priv);
-	msleep(50);
+	msleep(POLL_SLEEP_MS);
 
 	ret = csduo_open_endpoint(priv, endpoint);
 	if (ret)
 		return ret;
-	msleep(50);
+	msleep(POLL_SLEEP_MS);
 
-	ret = csduo_read_endpoint(priv, expected_dtype, 5);
-	msleep(50);
+	ret = csduo_read_endpoint(priv, expected_dtype, POLL_RETRY_COUNT);
+	msleep(POLL_SLEEP_MS);
 
 	csduo_close_endpoint(priv);
 	return ret;
@@ -243,20 +238,19 @@ static bool csduo_parse_fans(struct csduo_data *priv)
 	int i, base;
 	u16 raw;
 
-	if (priv->resp[2] != 0x00 || priv->resp[3] != DTYPE_FAN) {
+	if (priv->resp[RESP_ERR_OFF] != 0x00 || priv->resp[RESP_DTYPE_OFF] != DTYPE_FAN) {
 		for (i = 0; i < NUM_FANS; i++)
 			priv->fan_valid[i] = false;
 		return false;
 	}
 
 	for (i = 0; i < NUM_FANS; i++) {
-		if (i >= priv->resp[5]) {
+		if (i >= priv->resp[RESP_COUNT_OFF]) {
 			priv->fan_valid[i] = false;
 			continue;
 		}
-		base = 6 + i * 2;
-		raw = priv->resp[base] |
-		      ((u16)priv->resp[base + 1] << 8);
+		base = RESP_FAN_DATA_OFF + i * 2;
+		raw = get_unaligned_le16(&priv->resp[base]);
 		priv->fan_cache[i] = raw;
 		priv->fan_valid[i] = true;
 	}
@@ -268,24 +262,23 @@ static bool csduo_parse_temps(struct csduo_data *priv)
 	int i, base;
 	u16 raw;
 
-	if (priv->resp[2] != 0x00 || priv->resp[3] != DTYPE_TEMP) {
+	if (priv->resp[RESP_ERR_OFF] != 0x00 || priv->resp[RESP_DTYPE_OFF] != DTYPE_TEMP) {
 		for (i = 0; i < NUM_TEMPS; i++)
 			priv->temp_valid[i] = false;
 		return false;
 	}
 
 	for (i = 0; i < NUM_TEMPS; i++) {
-		if (i >= priv->resp[5]) {
+		if (i >= priv->resp[RESP_COUNT_OFF]) {
 			priv->temp_valid[i] = false;
 			continue;
 		}
-		base = 6 + i * 3;
+		base = RESP_TEMP_DATA_OFF + i * 3;
 		if (priv->resp[base] != 0x00) {
 			priv->temp_valid[i] = false;
 			continue;
 		}
-		raw = priv->resp[base + 1] |
-		      ((u16)priv->resp[base + 2] << 8);
+		raw = get_unaligned_le16(&priv->resp[base + 1]);
 		priv->temp_cache[i] = raw * 100;
 		priv->temp_valid[i] = true;
 	}
@@ -331,17 +324,27 @@ static int csduo_init_device(struct csduo_data *priv)
 {
 	int ret;
 
+	if (priv->init_last_fail &&
+	    time_before(jiffies, priv->init_last_fail +
+			msecs_to_jiffies(INIT_RETRY_DELAY_MS)))
+		return -EAGAIN;
+
 	ret = csduo_enter_software_mode(priv);
 	if (ret)
-		return ret;
-	msleep(100);
+		goto fail;
+	msleep(INIT_SETTLE_MS);
 
 	ret = csduo_poll_cycle(priv);
 	if (ret)
-		return ret;
+		goto fail;
 
+	priv->init_last_fail = 0;
 	priv->initialized = true;
 	return 0;
+
+fail:
+	priv->init_last_fail = jiffies;
+	return ret;
 }
 
 /* Ensure cache is fresh, polling if older than 1 second */
@@ -414,12 +417,12 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 	total_len = data_len + 2;
 
 	csduo_close_endpoint(priv);
-	msleep(50);
+	msleep(POLL_SLEEP_MS);
 
 	ret = csduo_open_endpoint(priv, EP_FAN_SPEED);
 	if (ret)
 		return ret;
-	msleep(50);
+	msleep(POLL_SLEEP_MS);
 
 	/* Write command: [08 06 <handle> <len_lo> <len_hi> 00 00 <dtype> <data>] */
 	cmd[0]  = 0x08;
@@ -438,13 +441,13 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 	cmd[13] = 0x00;
 
 	ret = csduo_send_recv(priv, cmd, sizeof(cmd));
-	msleep(50);
+	msleep(POLL_SLEEP_MS);
 
 	csduo_close_endpoint(priv);
 
 	if (ret)
 		return ret;
-	if (priv->resp[3] != DTYPE_PWM)
+	if (priv->resp[RESP_DTYPE_OFF] != DTYPE_PWM)
 		return -EIO;
 
 	priv->pwm_cache[channel] = (duty_pct * 255) / 100;
@@ -530,6 +533,18 @@ static int csduo_read_string(struct device *dev, enum hwmon_sensor_types type,
 	}
 	return 0;
 }
+
+static const struct hwmon_ops csduo_hwmon_ops = {
+	.is_visible = csduo_is_visible,
+	.read = csduo_read,
+	.write = csduo_write,
+	.read_string = csduo_read_string,
+};
+
+static const struct hwmon_chip_info csduo_chip_info = {
+	.ops = &csduo_hwmon_ops,
+	.info = csduo_info,
+};
 
 /* HID driver callbacks */
 
@@ -648,3 +663,4 @@ module_hid_driver(csduo_driver);
 MODULE_AUTHOR("David Mistretta");
 MODULE_DESCRIPTION("Corsair Commander Duo hwmon driver");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0");
