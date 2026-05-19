@@ -40,7 +40,6 @@
  * The device latches commanded fan speeds; no continuous resend required.
  */
 
-#include <asm/unaligned.h>
 #include <linux/delay.h>
 #include <linux/hid.h>
 #include <linux/hwmon.h>
@@ -48,6 +47,12 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/usb.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
 
 #define USB_VENDOR_ID_CORSAIR		0x1b1c
 #define USB_PRODUCT_ID_CMDR_DUO		0x0c56
@@ -447,8 +452,6 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 
 	if (ret)
 		return ret;
-	if (priv->resp[RESP_DTYPE_OFF] != DTYPE_PWM)
-		return -EIO;
 
 	priv->pwm_cache[channel] = (duty_pct * 255) / 100;
 	return 0;
