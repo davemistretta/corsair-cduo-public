@@ -68,13 +68,13 @@ Fan 1:       1200 RPM
 Fan 2:        900 RPM
 Probe 1:      +35.0°C
 Probe 2:      +38.0°C
-pwm1:            128.000
-pwm2:            255.000
+pwm1:             50%
+pwm2:            100%
 ```
 
 On **Ubuntu 24.04 / lm-sensors ≤ 3.6.0**, only fans and temperatures are shown — older lm-sensors silently ignored PWM sysfs attributes.
 
-The `pwm1`/`pwm2` values are the raw 0–255 duty cycle. lm-sensors 3.6.1 (December 2023) added PWM sensor support; Ubuntu 26.04 ships with lm-sensors 3.6.2, which reads and displays these attributes. The driver's hwmon interface is correct — this is expected behavior, not a bug.
+The `pwm1`/`pwm2` values are the current duty cycle, displayed as a percentage. lm-sensors 3.6.1 (December 2023) added PWM sensor support; Ubuntu 26.04 ships with lm-sensors 3.6.2, which reads and displays these attributes. The driver's hwmon interface is correct — this is expected behavior, not a bug.
 
 To suppress the PWM lines if the output is noisy, add an ignore directive to `/etc/sensors.d/corsair-cduo.conf`:
 
