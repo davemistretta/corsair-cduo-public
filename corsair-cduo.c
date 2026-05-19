@@ -72,6 +72,7 @@ struct csduo_data {
 	struct device *hwmon_dev;
 	struct mutex lock;
 	struct completion wait_input;
+	bool drain_next;     /* discard next report after a timeout */
 	u8 *cmd_buffer;  /* DMA-safe heap buffer, OUT_BUF_LEN bytes */
 	u8 resp[PKT_LEN];
 	bool initialized;
@@ -152,8 +153,10 @@ static int csduo_send_recv(struct csduo_data *priv, const u8 *cmd, int len)
 	}
 
 	if (!wait_for_completion_timeout(&priv->wait_input,
-					 msecs_to_jiffies(CMD_TIMEOUT_MS)))
+					 msecs_to_jiffies(CMD_TIMEOUT_MS))) {
+		priv->drain_next = true;
 		return -ETIMEDOUT;
+	}
 
 	hid_dbg(priv->hdev,
 		"cmd [%02x %02x %02x %02x %02x] resp [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
@@ -172,11 +175,13 @@ static int csduo_send_recv(struct csduo_data *priv, const u8 *cmd, int len)
  * cycle on handle 0xfc with the appropriate endpoint number.
  */
 
-static int csduo_close_endpoint(struct csduo_data *priv)
+static void csduo_close_endpoint(struct csduo_data *priv)
 {
 	static const u8 cmd[] = { 0x08, 0x05, 0x01, HANDLE_ID };
+	int ret = csduo_send_recv(priv, cmd, sizeof(cmd));
 
-	return csduo_send_recv(priv, cmd, sizeof(cmd));
+	if (ret)
+		hid_warn(priv->hdev, "close endpoint failed: %d\n", ret);
 }
 
 static int csduo_open_endpoint(struct csduo_data *priv, u8 endpoint)
@@ -205,8 +210,7 @@ static int csduo_read_endpoint(struct csduo_data *priv, u8 expected_dtype,
 		msleep(50);
 	}
 
-	/* Return success if we got a response, even if dtype didn't match */
-	return 0;
+	return -EIO;
 }
 
 /*
@@ -234,13 +238,16 @@ static int csduo_read_sensor(struct csduo_data *priv, u8 endpoint,
 
 /* Response parsing */
 
-static void csduo_parse_fans(struct csduo_data *priv)
+static bool csduo_parse_fans(struct csduo_data *priv)
 {
 	int i, base;
 	u16 raw;
 
-	if (priv->resp[2] != 0x00 || priv->resp[3] != DTYPE_FAN)
-		return;
+	if (priv->resp[2] != 0x00 || priv->resp[3] != DTYPE_FAN) {
+		for (i = 0; i < NUM_FANS; i++)
+			priv->fan_valid[i] = false;
+		return false;
+	}
 
 	for (i = 0; i < NUM_FANS; i++) {
 		if (i >= priv->resp[5]) {
@@ -253,15 +260,19 @@ static void csduo_parse_fans(struct csduo_data *priv)
 		priv->fan_cache[i] = raw;
 		priv->fan_valid[i] = true;
 	}
+	return true;
 }
 
-static void csduo_parse_temps(struct csduo_data *priv)
+static bool csduo_parse_temps(struct csduo_data *priv)
 {
 	int i, base;
 	u16 raw;
 
-	if (priv->resp[2] != 0x00 || priv->resp[3] != DTYPE_TEMP)
-		return;
+	if (priv->resp[2] != 0x00 || priv->resp[3] != DTYPE_TEMP) {
+		for (i = 0; i < NUM_TEMPS; i++)
+			priv->temp_valid[i] = false;
+		return false;
+	}
 
 	for (i = 0; i < NUM_TEMPS; i++) {
 		if (i >= priv->resp[5]) {
@@ -278,6 +289,7 @@ static void csduo_parse_temps(struct csduo_data *priv)
 		priv->temp_cache[i] = raw * 100;
 		priv->temp_valid[i] = true;
 	}
+	return true;
 }
 
 /* Device initialization and polling */
@@ -295,19 +307,23 @@ static int csduo_enter_software_mode(struct csduo_data *priv)
  */
 static int csduo_poll_cycle(struct csduo_data *priv)
 {
+	bool fans_ok, temps_ok;
 	int ret;
 
 	ret = csduo_read_sensor(priv, EP_SPEEDS, DTYPE_FAN);
 	if (ret)
 		return ret;
-	csduo_parse_fans(priv);
+	fans_ok = csduo_parse_fans(priv);
 
 	ret = csduo_read_sensor(priv, EP_TEMPS, DTYPE_TEMP);
 	if (ret)
 		return ret;
-	csduo_parse_temps(priv);
+	temps_ok = csduo_parse_temps(priv);
 
-	priv->temp_updated = jiffies;
+	if (fans_ok && temps_ok)
+		priv->temp_updated = jiffies;
+	else
+		priv->temp_updated = 0;
 	return 0;
 }
 
@@ -428,8 +444,10 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 
 	if (ret)
 		return ret;
+	if (priv->resp[3] != DTYPE_PWM)
+		return -EIO;
 
-	priv->pwm_cache[channel] = (u8)val;
+	priv->pwm_cache[channel] = (duty_pct * 255) / 100;
 	return 0;
 }
 
@@ -522,6 +540,9 @@ static int csduo_probe(struct hid_device *hdev,
 	struct csduo_data *priv;
 	int ret;
 
+	if (!hid_is_usb(hdev))
+		return -ENODEV;
+
 	usbif = to_usb_interface(hdev->dev.parent);
 	if (usbif->cur_altsetting->desc.bInterfaceNumber != 0)
 		return -ENODEV;
@@ -553,7 +574,7 @@ static int csduo_probe(struct hid_device *hdev,
 		goto err_stop;
 	}
 
-	priv->hwmon_dev = devm_hwmon_device_register_with_info(
+	priv->hwmon_dev = hwmon_device_register_with_info(
 		&hdev->dev, "corsaircmdrduo", priv,
 		&csduo_chip_info, NULL);
 	if (IS_ERR(priv->hwmon_dev)) {
@@ -578,6 +599,8 @@ static void csduo_remove(struct hid_device *hdev)
 	struct csduo_data *priv = hid_get_drvdata(hdev);
 	static const u8 cmd[] = { 0x08, 0x01, 0x03, 0x00, 0x01 };
 
+	hwmon_device_unregister(priv->hwmon_dev);
+
 	mutex_lock(&priv->lock);
 	if (priv->initialized)
 		csduo_send_recv(priv, cmd, sizeof(cmd));
@@ -585,6 +608,7 @@ static void csduo_remove(struct hid_device *hdev)
 
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
+	mutex_destroy(&priv->lock);
 }
 
 static int csduo_raw_event(struct hid_device *hdev,
@@ -592,6 +616,11 @@ static int csduo_raw_event(struct hid_device *hdev,
 {
 	struct csduo_data *priv = hid_get_drvdata(hdev);
 	int n = min_t(int, size, PKT_LEN);
+
+	if (priv->drain_next) {
+		priv->drain_next = false;
+		return 0;
+	}
 
 	memset(priv->resp, 0, PKT_LEN);
 	memcpy(priv->resp, data, n);
