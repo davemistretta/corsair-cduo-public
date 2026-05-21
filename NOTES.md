@@ -132,9 +132,12 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 
 | Kernel | Distribution | Result |
 |---|---|---|
-| 6.8.0-106-generic | Ubuntu 24.04 | All features working |
-| 6.14.0-37-generic | Ubuntu 24.04 (HWE) | All features working |
-| 6.14+ | Ubuntu 26.04 | All features working; PWM visible in `sensors` (lm-sensors ≥ 3.6.1) |
+| 6.8.0-101-generic | Ubuntu 24.04 (GA) | All features working |
+| 6.17.0-29-generic | Ubuntu 24.04 (HWE) | All features working |
+| 7.0.0-15-generic | Ubuntu 26.04 | All features working; PWM visible in `sensors` (lm-sensors ≥ 3.6.1) |
+
+The GA (6.8) and HWE (6.17) kernels exercise both sides of the `unaligned.h`
+include split: `<asm/unaligned.h>` on < 6.12 and `<linux/unaligned.h>` on ≥ 6.12.
 
 ---
 
