@@ -123,14 +123,21 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 - **Device state degrades after multiple `rmmod`/`insmod` without USB replug.**
   Fan data may stop appearing. Fix: unplug/replug the Commander Duo USB connector.
 
+- **`sensors` displays PWM values on Ubuntu 26.04+ / lm-sensors ≥ 3.6.1.**
+  lm-sensors 3.6.1 (December 2023) added PWM sensor support. Ubuntu 24.04 shipped with lm-sensors 3.6.0 (which silently ignored `pwm*` sysfs attributes); Ubuntu 26.04 ships with 3.6.2 (which reads and displays them). The driver's hwmon interface is correct — this is expected behavior. To suppress the output, see the `sensors.conf` ignore directive in README.md.
+
 ---
 
 ## Tested Kernels
 
 | Kernel | Distribution | Result |
 |---|---|---|
-| 6.8.0-106-generic | Ubuntu 24.04 | All features working |
-| 6.14.0-37-generic | Ubuntu 24.04 (HWE) | All features working |
+| 6.8.0-101-generic | Ubuntu 24.04 (GA) | All features working |
+| 6.17.0-29-generic | Ubuntu 24.04 (HWE) | All features working |
+| 7.0.0-15-generic | Ubuntu 26.04 | All features working; PWM visible in `sensors` (lm-sensors ≥ 3.6.1) |
+
+The GA (6.8) and HWE (6.17) kernels exercise both sides of the `unaligned.h`
+include split: `<asm/unaligned.h>` on < 6.12 and `<linux/unaligned.h>` on ≥ 6.12.
 
 ---
 
