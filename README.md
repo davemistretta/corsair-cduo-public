@@ -34,7 +34,7 @@ To install permanently:
 ```sh
 sudo make install
 sudo depmod -a
-echo "corsair_cduo" | sudo tee /etc/modules-load.d/corsair-cduo.conf
+echo "corsair-cduo" | sudo tee /etc/modules-load.d/corsair-cduo.conf
 ```
 
 Or use DKMS:
