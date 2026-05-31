@@ -113,6 +113,7 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 | `fan2_input` | RO | Fan 2 RPM |
 | `pwm1` | RW | Fan 1 duty cycle (0-255) |
 | `pwm2` | RW | Fan 2 duty cycle (0-255) |
+| `firmware_version` | RO | Device firmware version string (e.g. `0.8.105`) |
 | `temp1_label` | RO | "Probe 1" |
 | `temp2_label` | RO | "Probe 2" |
 | `fan1_label` | RO | "Fan 1" |
@@ -122,6 +123,14 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 
 - **Device state degrades after multiple `rmmod`/`insmod` without USB replug.**
   Fan data may stop appearing. Fix: unplug/replug the Commander Duo USB connector.
+
+- **`fan_input = 0` can mean "fan present, no tach signal."**
+  Some Corsair fans don't expose a tachometer wire — they still take PWM
+  commands fine, they just never report RPM. The driver reads the device's
+  per-channel tach status at probe time (EP `0x1a`, `DTYPE_FAN_STATUS = 0x09`)
+  and logs each channel's status to dmesg once. Observed values: `0x03` =
+  tach present, `0x01` = no tach signal. Check `dmesg | grep cduo` if a
+  `fan_input` of 0 is unexpected.
 
 - **`sensors` displays PWM values on Ubuntu 26.04+ / lm-sensors ≥ 3.6.1.**
   lm-sensors 3.6.1 (December 2023) added PWM sensor support. Ubuntu 24.04 shipped with lm-sensors 3.6.0 (which silently ignored `pwm*` sysfs attributes); Ubuntu 26.04 ships with 3.6.2 (which reads and displays them). The driver's hwmon interface is correct — this is expected behavior. To suppress the output, see the `sensors.conf` ignore directive in README.md.
