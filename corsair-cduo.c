@@ -65,13 +65,15 @@
 
 #define HANDLE_ID	0xfc	/* CommanderCore communication handle */
 
-#define DTYPE_TEMP	0x10
-#define DTYPE_FAN	0x06
-#define DTYPE_PWM	0x07
+#define DTYPE_TEMP		0x10
+#define DTYPE_FAN		0x06
+#define DTYPE_PWM		0x07
+#define DTYPE_FAN_STATUS	0x09
 
 #define EP_SPEEDS	0x17
 #define EP_TEMPS	0x21
 #define EP_FAN_SPEED	0x18
+#define EP_FAN_STATUS	0x1a	/* per-channel tach status (0x03 = tach present) */
 
 #define POLL_RETRY_COUNT	5	/* read_endpoint max retries */
 #define POLL_SLEEP_MS		50	/* ms between endpoint operations */
@@ -101,6 +103,8 @@ struct csduo_data {
 	long fan_cache[NUM_FANS]; /* RPM */
 	bool fan_valid[NUM_FANS];
 	u8 pwm_cache[NUM_FANS];    /* last-written PWM value, 0-255 */
+	bool fan_status_logged;    /* one-shot probe-time fan status dmesg */
+	char firmware[16];         /* "v1.v2.v3" from cmd [02 13] */
 };
 
 static const char * const csduo_temp_labels[] = {
@@ -284,7 +288,7 @@ static bool csduo_parse_temps(struct csduo_data *priv)
 			continue;
 		}
 		raw = get_unaligned_le16(&priv->resp[base + 1]);
-		priv->temp_cache[i] = raw * 100;
+		priv->temp_cache[i] = (long)(s16)raw * 100;
 		priv->temp_valid[i] = true;
 	}
 	return true;
@@ -297,6 +301,64 @@ static int csduo_enter_software_mode(struct csduo_data *priv)
 	static const u8 cmd[] = { 0x08, 0x01, 0x03, 0x00, 0x02 };
 
 	return csduo_send_recv(priv, cmd, sizeof(cmd));
+}
+
+/*
+ * Read firmware version via the device's control cmd [02 13]. Response format
+ * differs from sensor reads: resp[1] echoes the cmd byte (0x02), resp[3..4]
+ * are the major/minor, and resp[5..6] are the build number (LE16). This call
+ * does not require software mode and is safe to invoke at probe time.
+ */
+static int csduo_get_firmware_version(struct csduo_data *priv)
+{
+	static const u8 cmd[] = { 0x08, 0x02, 0x13 };
+	int ret;
+
+	ret = csduo_send_recv(priv, cmd, sizeof(cmd));
+	if (ret)
+		return ret;
+	if (priv->resp[RESP_ERR_OFF] != 0x00)
+		return -EIO;
+
+	snprintf(priv->firmware, sizeof(priv->firmware), "%u.%u.%u",
+		 priv->resp[3], priv->resp[4],
+		 get_unaligned_le16(&priv->resp[5]));
+	return 0;
+}
+
+/*
+ * One-shot diagnostic: read EP 0x1a (fan status) and log each channel's
+ * status byte. Observed values: 0x03 = fan with working tach signal,
+ * 0x01 = fan present but no tach signal. Other values are reported as
+ * "unknown". This explains a fan_input of 0 in dmesg without changing
+ * any userspace surface.
+ */
+static void csduo_log_fan_status(struct csduo_data *priv)
+{
+	const char *desc;
+	int ret, i;
+	u8 count, status;
+
+	ret = csduo_read_sensor(priv, EP_FAN_STATUS, DTYPE_FAN_STATUS);
+	if (ret) {
+		hid_dbg(priv->hdev, "fan status read failed: %d\n", ret);
+		return;
+	}
+	if (priv->resp[RESP_ERR_OFF] != 0x00 ||
+	    priv->resp[RESP_DTYPE_OFF] != DTYPE_FAN_STATUS)
+		return;
+
+	count = priv->resp[RESP_COUNT_OFF];
+	for (i = 0; i < count && i < NUM_FANS; i++) {
+		status = priv->resp[RESP_FAN_DATA_OFF + i];
+		switch (status) {
+		case 0x03: desc = "tach signal present"; break;
+		case 0x01: desc = "no tach signal"; break;
+		default:   desc = "unknown"; break;
+		}
+		hid_info(priv->hdev, "fan%d: status 0x%02x (%s)\n",
+			 i + 1, status, desc);
+	}
 }
 
 /*
@@ -339,9 +401,20 @@ static int csduo_init_device(struct csduo_data *priv)
 		goto fail;
 	msleep(INIT_SETTLE_MS);
 
+	/* One-shot firmware read after software mode is active. */
+	if (!priv->firmware[0]) {
+		if (csduo_get_firmware_version(priv) == 0)
+			hid_info(priv->hdev, "firmware %s\n", priv->firmware);
+	}
+
 	ret = csduo_poll_cycle(priv);
 	if (ret)
 		goto fail;
+
+	if (!priv->fan_status_logged) {
+		csduo_log_fan_status(priv);
+		priv->fan_status_logged = true;
+	}
 
 	priv->init_last_fail = 0;
 	priv->initialized = true;
@@ -403,7 +476,7 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 	u8 cmd[14];
 	u8 duty_pct;
 	int data_len, total_len;
-	int ret;
+	int ret, i;
 
 	if (channel < 0 || channel >= NUM_FANS)
 		return -EINVAL;
@@ -445,13 +518,25 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 	cmd[12] = duty_pct;
 	cmd[13] = 0x00;
 
-	ret = csduo_send_recv(priv, cmd, sizeof(cmd));
+	/*
+	 * The device occasionally NAKs a PWM write (resp[RESP_ERR_OFF] != 0).
+	 * Retry briefly so a transient NAK doesn't bubble up as -EIO to
+	 * userspace.
+	 */
+	for (i = 0; i < POLL_RETRY_COUNT; i++) {
+		ret = csduo_send_recv(priv, cmd, sizeof(cmd));
+		if (ret == 0 && priv->resp[RESP_ERR_OFF] == 0x00)
+			break;
+		msleep(POLL_SLEEP_MS);
+	}
 	msleep(POLL_SLEEP_MS);
 
 	csduo_close_endpoint(priv);
 
 	if (ret)
 		return ret;
+	if (priv->resp[RESP_ERR_OFF] != 0x00)
+		return -EIO;
 
 	priv->pwm_cache[channel] = (duty_pct * 255) / 100;
 	return 0;
@@ -549,6 +634,28 @@ static const struct hwmon_chip_info csduo_chip_info = {
 	.info = csduo_info,
 };
 
+static ssize_t firmware_version_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct csduo_data *priv = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n",
+			  priv->firmware[0] ? priv->firmware : "unknown");
+}
+static DEVICE_ATTR_RO(firmware_version);
+
+static struct attribute *csduo_attrs[] = {
+	&dev_attr_firmware_version.attr,
+	NULL,
+};
+static const struct attribute_group csduo_group = {
+	.attrs = csduo_attrs,
+};
+static const struct attribute_group *csduo_groups[] = {
+	&csduo_group,
+	NULL,
+};
+
 /* HID driver callbacks */
 
 static int csduo_probe(struct hid_device *hdev,
@@ -594,7 +701,7 @@ static int csduo_probe(struct hid_device *hdev,
 
 	priv->hwmon_dev = hwmon_device_register_with_info(
 		&hdev->dev, "corsaircmdrduo", priv,
-		&csduo_chip_info, NULL);
+		&csduo_chip_info, csduo_groups);
 	if (IS_ERR(priv->hwmon_dev)) {
 		ret = PTR_ERR(priv->hwmon_dev);
 		hid_err(hdev, "hwmon register failed: %d\n", ret);

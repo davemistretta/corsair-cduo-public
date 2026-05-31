@@ -98,6 +98,7 @@ chip "corsaircmdrduo-*"
 | `fan2_label` | RO | "Fan 2" |
 | `pwm1` | RW | Fan 1 duty cycle (0-255) |
 | `pwm2` | RW | Fan 2 duty cycle (0-255) |
+| `firmware_version` | RO | Device firmware version string (e.g. `0.8.105`) |
 
 ### Setting Fan Speed
 
