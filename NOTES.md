@@ -125,7 +125,7 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
   Fan data may stop appearing. Fix: unplug/replug the Commander Duo USB connector.
 
 - **`fan_input = 0` can mean "fan present, no tach signal."**
-  Some Corsair fans don't expose a tachometer wire — they still take PWM
+  Some fans don't expose a tachometer wire — they still take PWM
   commands fine, they just never report RPM. The driver reads the device's
   per-channel tach status at probe time (EP `0x1a`, `DTYPE_FAN_STATUS = 0x09`)
   and logs each channel's status to dmesg once. Observed values: `0x03` =
