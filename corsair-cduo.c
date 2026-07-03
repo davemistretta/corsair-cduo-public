@@ -428,10 +428,28 @@ fail:
 /* Ensure cache is fresh, polling if older than 1 second */
 static int csduo_ensure_fresh(struct csduo_data *priv)
 {
+	int ret;
+
 	if (time_before(jiffies, priv->temp_updated + HZ))
 		return 0;
 
-	return csduo_poll_cycle(priv);
+	ret = csduo_poll_cycle(priv);
+	if (!ret)
+		return 0;
+
+	/*
+	 * The device intermittently drops out of software mode (e.g. after a
+	 * USB power-management event or an idle period). Its fan endpoint then
+	 * answers with error byte 0x03 and the temp dtype instead of fan data,
+	 * so the poll fails with -EIO and stays broken because we only ever
+	 * initialize once. Re-enter software mode and retry — this recovers the
+	 * session in place, equivalent to an rmmod/modprobe but with no USB
+	 * replug. csduo_init_device keeps its own failure backoff, so a recovery
+	 * that itself fails won't be retried on every single read.
+	 */
+	hid_dbg(priv->hdev, "poll failed (%d); re-initializing device\n", ret);
+	priv->initialized = false;
+	return csduo_init_device(priv);
 }
 
 static int csduo_read_temp(struct csduo_data *priv, int channel, long *val)
