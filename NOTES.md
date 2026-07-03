@@ -163,9 +163,6 @@ handles all of them — none require user action.
   tach present, `0x01` = no tach signal. Check `dmesg | grep cduo` if a
   `fan_input` of 0 is unexpected.
 
-- **`sensors` displays PWM values on Ubuntu 26.04+ / lm-sensors ≥ 3.6.1.**
-  lm-sensors 3.6.1 (December 2023) added PWM sensor support. Ubuntu 24.04 shipped with lm-sensors 3.6.0 (which silently ignored `pwm*` sysfs attributes); Ubuntu 26.04 ships with 3.6.2 (which reads and displays them). The driver's hwmon interface is correct — this is expected behavior. To suppress the output, see the `sensors.conf` ignore directive in README.md.
-
 ---
 
 ## Tested Kernels
