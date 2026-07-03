@@ -11,6 +11,7 @@ Exposes fan RPM, temperature sensors, and per-channel PWM fan speed control via 
 - **Independent PWM control** - `pwm1`, `pwm2` (0-255), each fan independently addressable
 - **Labels** - `temp1_label`, `fan1_label`, etc. for sensor identification
 - **Speed latching** - device holds commanded speed; no background polling required
+- **Self-healing** - if the device drops its software-mode session (seen after USB power-management events or long idle), the driver re-enters software mode automatically and restores commanded fan speeds
 - **Hardware mode restore** - device returns to default behavior on driver unload
 - Uses the CommanderCore protocol (same as [FanControl.CorsairLink](https://github.com/EvanMulawski/FanControl.CorsairLink))
 
@@ -112,7 +113,12 @@ echo 128 | sudo tee $HWMON/pwm1
 echo 255 | sudo tee $HWMON/pwm2
 ```
 
-The device latches the commanded speed. It will hold the target until a new value is written or the driver is unloaded.
+The device latches the commanded speed. It will hold the target until a new value is written or the driver is unloaded. Reading `pwm1`/`pwm2` returns exactly the last value written.
+
+## Troubleshooting
+
+- **`recovered from failed poll (...) by re-entering software mode` in dmesg** — informational, not an error. The device intermittently drops its software-mode session (typically after USB power-management events or long idle); the driver detected it, recovered automatically, and restored any commanded fan speeds.
+- **`fan1_input` or `fan2_input` reads 0** — often "fan present, but no tach wire." The driver logs each channel's tach status to dmesg once at first use (`fanN: status 0x03 (tach signal present)` / `0x01 (no tach signal)`).
 
 ## Protocol
 
