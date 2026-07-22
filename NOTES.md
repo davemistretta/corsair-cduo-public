@@ -102,6 +102,11 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 | Hardware mode on remove | `csduo_remove()` sends EnterHardwareMode so device returns to default behavior |
 | `HWMON_PWM_INPUT` | Native hwmon PWM channel registration (no workarounds needed) |
 | Labels via `read_string` | `hwmon_ops.read_string` provides "Probe 1", "Fan 1", etc. |
+| Response-to-command matching | Responses echo the command opcode in byte 1; `csduo_raw_event` drops any report whose opcode doesn't match the in-flight command, so a late reply to a timed-out command can't satisfy the next caller or shift subsequent exchanges off by one |
+| Parse before close | The read response is snapshotted before the trailing close command, whose reply overwrites the response buffer (see the buffer-echo quirk below) |
+| Self-heal on poll failure | `csduo_ensure_fresh()` re-enters software mode when a poll fails — transport error or parse failure (error byte / wrong dtype). A successful recovery logs at `hid_info` |
+| PWM restore after re-init | Re-entering software mode can reset the device's commanded duty, so `csduo_init_device()` replays every userspace-written PWM channel after a successful (re-)init |
+| Exact PWM readback | `pwm1`/`pwm2` read back exactly the last value written (the 0–255 → percent conversion is not round-tripped) |
 
 ### sysfs attributes (hwmon)
 
@@ -121,8 +126,34 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 
 ### Known quirks
 
-- **Device state degrades after multiple `rmmod`/`insmod` without USB replug.**
-  Fan data may stop appearing. Fix: unplug/replug the Commander Duo USB connector.
+These are behaviors of the device/firmware, not of the driver. The driver
+handles all of them — none require user action.
+
+- **The device intermittently drops its software-mode session.**
+  Observed after USB power-management events and extended idle. In that state
+  the fan endpoint answers reads with error byte `0x03` and the wrong dtype,
+  so sensor reads would fail while PWM appears fine. **The driver recovers
+  automatically**: on a failed poll it re-enters software mode, re-polls, and
+  restores any commanded fan speeds. A successful recovery logs
+  `recovered from failed poll (...) by re-entering software mode` to dmesg at
+  info level. (This same session drop was the cause of historical "fan data
+  disappears after repeated `rmmod`/`insmod`" symptoms — no USB replug is
+  needed, re-entering software mode is the actual fix.)
+
+- **Close/open responses echo the previous data buffer.**
+  The reply to a close (`[08 05 01 fc]`) or open (`[08 0d fc xx]`) command
+  carries the err/dtype/data bytes of the device's *previous* response, with
+  only the opcode-echo byte (`resp[1]`) changed. Confirmed on firmware
+  0.8.105 via dynamic-debug capture:
+
+  ```
+  read  resp [00 08 00 06 00 02 d2 04 ...]   <- fan data
+  close resp [00 05 00 06 00 02 d2 04 ...]   <- same payload, opcode swapped
+  ```
+
+  **The driver does not rely on this** — read responses are snapshotted
+  before the trailing close. The opcode echo in `resp[1]` (which appears in
+  every response type) *is* used, for response-to-command matching.
 
 - **`fan_input = 0` can mean "fan present, no tach signal."**
   Some fans don't expose a tachometer wire — they still take PWM
@@ -132,18 +163,20 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
   tach present, `0x01` = no tach signal. Check `dmesg | grep cduo` if a
   `fan_input` of 0 is unexpected.
 
-- **`sensors` displays PWM values on Ubuntu 26.04+ / lm-sensors ≥ 3.6.1.**
-  lm-sensors 3.6.1 (December 2023) added PWM sensor support. Ubuntu 24.04 shipped with lm-sensors 3.6.0 (which silently ignored `pwm*` sysfs attributes); Ubuntu 26.04 ships with 3.6.2 (which reads and displays them). The driver's hwmon interface is correct — this is expected behavior. To suppress the output, see the `sensors.conf` ignore directive in README.md.
-
 ---
 
 ## Tested Kernels
 
 | Kernel | Distribution | Result |
 |---|---|---|
-| 6.8.0-101-generic | Ubuntu 24.04 (GA) | All features working |
-| 6.17.0-29-generic | Ubuntu 24.04 (HWE) | All features working |
-| 7.0.0-15-generic | Ubuntu 26.04 | All features working; PWM visible in `sensors` (lm-sensors ≥ 3.6.1) |
+| 6.8.0-101-generic | Ubuntu 24.04 (GA) | All features working¹ |
+| 6.17.0-29-generic | Ubuntu 24.04 (HWE) | All features working¹ |
+| 7.0.0-27-generic | Ubuntu 26.04 | All features working, including the self-heal/hardening revision (live-validated on hardware) |
+
+¹ Tested at an earlier driver revision (before the self-heal and protocol
+hardening changes). Those changes introduce no new kernel API usage, so the
+supported-kernel floor is unchanged; they just haven't been re-run on these
+kernels.
 
 The GA (6.8) and HWE (6.17) kernels exercise both sides of the `unaligned.h`
 include split: `<asm/unaligned.h>` on < 6.12 and `<linux/unaligned.h>` on ≥ 6.12.

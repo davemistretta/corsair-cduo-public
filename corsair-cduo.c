@@ -92,7 +92,7 @@ struct csduo_data {
 	struct device *hwmon_dev;
 	struct mutex lock;
 	struct completion wait_input;
-	bool drain_next;     /* discard next report after a timeout */
+	u8 expect_cmd;   /* opcode of the in-flight command; other reports dropped */
 	u8 *cmd_buffer;  /* DMA-safe heap buffer, OUT_BUF_LEN bytes */
 	u8 resp[PKT_LEN];
 	bool initialized;
@@ -103,6 +103,7 @@ struct csduo_data {
 	long fan_cache[NUM_FANS]; /* RPM */
 	bool fan_valid[NUM_FANS];
 	u8 pwm_cache[NUM_FANS];    /* last-written PWM value, 0-255 */
+	bool pwm_written[NUM_FANS]; /* channel has a userspace-commanded duty */
 	bool fan_status_logged;    /* one-shot probe-time fan status dmesg */
 	char firmware[16];         /* "v1.v2.v3" from cmd [02 13] */
 };
@@ -148,6 +149,7 @@ static int csduo_send_recv(struct csduo_data *priv, const u8 *cmd, int len)
 	memset(priv->cmd_buffer, 0, OUT_BUF_LEN);
 	priv->cmd_buffer[0] = 0x00; /* report ID */
 	memcpy(priv->cmd_buffer + 1, cmd, min_t(int, len, PKT_LEN));
+	priv->expect_cmd = len > 1 ? cmd[1] : 0;
 	reinit_completion(&priv->wait_input);
 
 	ret = hid_hw_output_report(priv->hdev, priv->cmd_buffer, OUT_BUF_LEN);
@@ -157,10 +159,8 @@ static int csduo_send_recv(struct csduo_data *priv, const u8 *cmd, int len)
 	}
 
 	if (!wait_for_completion_timeout(&priv->wait_input,
-					 msecs_to_jiffies(CMD_TIMEOUT_MS))) {
-		priv->drain_next = true;
+					 msecs_to_jiffies(CMD_TIMEOUT_MS)))
 		return -ETIMEDOUT;
-	}
 
 	hid_dbg(priv->hdev,
 		"cmd [%02x %02x %02x %02x %02x] resp [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
@@ -218,10 +218,14 @@ static int csduo_read_endpoint(struct csduo_data *priv, u8 expected_dtype,
 }
 
 /*
- * Full close-open-read-close cycle for a sensor endpoint.
+ * Full close-open-read-close cycle for a sensor endpoint. On success the
+ * read response is copied to resp_out (PKT_LEN bytes) before the trailing
+ * close, whose reply overwrites priv->resp. (Current firmware happens to
+ * echo the previous data buffer in close/open responses, but that is an
+ * undocumented quirk — never parse priv->resp after the close.)
  */
 static int csduo_read_sensor(struct csduo_data *priv, u8 endpoint,
-			     u8 expected_dtype)
+			     u8 expected_dtype, u8 *resp_out)
 {
 	int ret;
 
@@ -234,6 +238,8 @@ static int csduo_read_sensor(struct csduo_data *priv, u8 endpoint,
 	msleep(POLL_SLEEP_MS);
 
 	ret = csduo_read_endpoint(priv, expected_dtype, POLL_RETRY_COUNT);
+	if (!ret)
+		memcpy(resp_out, priv->resp, PKT_LEN);
 	msleep(POLL_SLEEP_MS);
 
 	csduo_close_endpoint(priv);
@@ -242,52 +248,52 @@ static int csduo_read_sensor(struct csduo_data *priv, u8 endpoint,
 
 /* Response parsing */
 
-static bool csduo_parse_fans(struct csduo_data *priv)
+static bool csduo_parse_fans(struct csduo_data *priv, const u8 *resp)
 {
 	int i, base;
 	u16 raw;
 
-	if (priv->resp[RESP_ERR_OFF] != 0x00 || priv->resp[RESP_DTYPE_OFF] != DTYPE_FAN) {
+	if (resp[RESP_ERR_OFF] != 0x00 || resp[RESP_DTYPE_OFF] != DTYPE_FAN) {
 		for (i = 0; i < NUM_FANS; i++)
 			priv->fan_valid[i] = false;
 		return false;
 	}
 
 	for (i = 0; i < NUM_FANS; i++) {
-		if (i >= priv->resp[RESP_COUNT_OFF]) {
+		if (i >= resp[RESP_COUNT_OFF]) {
 			priv->fan_valid[i] = false;
 			continue;
 		}
 		base = RESP_FAN_DATA_OFF + i * 2;
-		raw = get_unaligned_le16(&priv->resp[base]);
+		raw = get_unaligned_le16(&resp[base]);
 		priv->fan_cache[i] = raw;
 		priv->fan_valid[i] = true;
 	}
 	return true;
 }
 
-static bool csduo_parse_temps(struct csduo_data *priv)
+static bool csduo_parse_temps(struct csduo_data *priv, const u8 *resp)
 {
 	int i, base;
 	u16 raw;
 
-	if (priv->resp[RESP_ERR_OFF] != 0x00 || priv->resp[RESP_DTYPE_OFF] != DTYPE_TEMP) {
+	if (resp[RESP_ERR_OFF] != 0x00 || resp[RESP_DTYPE_OFF] != DTYPE_TEMP) {
 		for (i = 0; i < NUM_TEMPS; i++)
 			priv->temp_valid[i] = false;
 		return false;
 	}
 
 	for (i = 0; i < NUM_TEMPS; i++) {
-		if (i >= priv->resp[RESP_COUNT_OFF]) {
+		if (i >= resp[RESP_COUNT_OFF]) {
 			priv->temp_valid[i] = false;
 			continue;
 		}
 		base = RESP_TEMP_DATA_OFF + i * 3;
-		if (priv->resp[base] != 0x00) {
+		if (resp[base] != 0x00) {
 			priv->temp_valid[i] = false;
 			continue;
 		}
-		raw = get_unaligned_le16(&priv->resp[base + 1]);
+		raw = get_unaligned_le16(&resp[base + 1]);
 		priv->temp_cache[i] = (long)(s16)raw * 100;
 		priv->temp_valid[i] = true;
 	}
@@ -335,22 +341,23 @@ static int csduo_get_firmware_version(struct csduo_data *priv)
  */
 static void csduo_log_fan_status(struct csduo_data *priv)
 {
+	u8 resp[PKT_LEN];
 	const char *desc;
 	int ret, i;
 	u8 count, status;
 
-	ret = csduo_read_sensor(priv, EP_FAN_STATUS, DTYPE_FAN_STATUS);
+	ret = csduo_read_sensor(priv, EP_FAN_STATUS, DTYPE_FAN_STATUS, resp);
 	if (ret) {
 		hid_dbg(priv->hdev, "fan status read failed: %d\n", ret);
 		return;
 	}
-	if (priv->resp[RESP_ERR_OFF] != 0x00 ||
-	    priv->resp[RESP_DTYPE_OFF] != DTYPE_FAN_STATUS)
+	if (resp[RESP_ERR_OFF] != 0x00 ||
+	    resp[RESP_DTYPE_OFF] != DTYPE_FAN_STATUS)
 		return;
 
-	count = priv->resp[RESP_COUNT_OFF];
+	count = resp[RESP_COUNT_OFF];
 	for (i = 0; i < count && i < NUM_FANS; i++) {
-		status = priv->resp[RESP_FAN_DATA_OFF + i];
+		status = resp[RESP_FAN_DATA_OFF + i];
 		switch (status) {
 		case 0x03: desc = "tach signal present"; break;
 		case 0x01: desc = "no tach signal"; break;
@@ -362,34 +369,43 @@ static void csduo_log_fan_status(struct csduo_data *priv)
 }
 
 /*
- * Poll the device for sensor data. Reads fan RPM and temperatures
- * via separate endpoint cycles. Must be called with priv->lock held.
+ * Poll the device for sensor data. Reads fan RPM and temperatures via
+ * separate endpoint cycles. Must be called with priv->lock held.
+ *
+ * A parse failure (device answered, but with an error byte or wrong dtype)
+ * returns -EIO like a transport failure so csduo_ensure_fresh treats both
+ * as a degraded session and re-enters software mode.
  */
 static int csduo_poll_cycle(struct csduo_data *priv)
 {
-	bool fans_ok, temps_ok;
+	u8 resp[PKT_LEN];
 	int ret;
 
-	ret = csduo_read_sensor(priv, EP_SPEEDS, DTYPE_FAN);
+	ret = csduo_read_sensor(priv, EP_SPEEDS, DTYPE_FAN, resp);
 	if (ret)
 		return ret;
-	fans_ok = csduo_parse_fans(priv);
-
-	ret = csduo_read_sensor(priv, EP_TEMPS, DTYPE_TEMP);
-	if (ret)
-		return ret;
-	temps_ok = csduo_parse_temps(priv);
-
-	if (fans_ok && temps_ok)
-		priv->temp_updated = jiffies;
-	else
+	if (!csduo_parse_fans(priv, resp)) {
 		priv->temp_updated = 0;
+		return -EIO;
+	}
+
+	ret = csduo_read_sensor(priv, EP_TEMPS, DTYPE_TEMP, resp);
+	if (ret)
+		return ret;
+	if (!csduo_parse_temps(priv, resp)) {
+		priv->temp_updated = 0;
+		return -EIO;
+	}
+
+	priv->temp_updated = jiffies;
 	return 0;
 }
 
+static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val);
+
 static int csduo_init_device(struct csduo_data *priv)
 {
-	int ret;
+	int ret, i;
 
 	if (priv->init_last_fail &&
 	    time_before(jiffies, priv->init_last_fail +
@@ -418,6 +434,22 @@ static int csduo_init_device(struct csduo_data *priv)
 
 	priv->init_last_fail = 0;
 	priv->initialized = true;
+
+	/*
+	 * Re-entering software mode can reset the device's commanded duty
+	 * cycle. Restore any channel userspace has written so a self-heal
+	 * does not leave the fans at the firmware default. Best-effort: a
+	 * failed restore must not fail the init that just succeeded.
+	 */
+	for (i = 0; i < NUM_FANS; i++) {
+		if (!priv->pwm_written[i])
+			continue;
+		if (csduo_write_fan_pwm(priv, i, priv->pwm_cache[i]))
+			hid_warn(priv->hdev,
+				 "failed to restore pwm%d after re-init\n",
+				 i + 1);
+	}
+
 	return 0;
 
 fail:
@@ -428,10 +460,33 @@ fail:
 /* Ensure cache is fresh, polling if older than 1 second */
 static int csduo_ensure_fresh(struct csduo_data *priv)
 {
+	int ret, err;
+
 	if (time_before(jiffies, priv->temp_updated + HZ))
 		return 0;
 
-	return csduo_poll_cycle(priv);
+	ret = csduo_poll_cycle(priv);
+	if (!ret)
+		return 0;
+
+	/*
+	 * The device intermittently drops out of software mode (e.g. after a
+	 * USB power-management event or an idle period). Its fan endpoint then
+	 * answers with error byte 0x03 and the temp dtype instead of fan data,
+	 * so the poll fails with -EIO and stays broken because we only ever
+	 * initialize once. Re-enter software mode and retry — this recovers the
+	 * session in place, equivalent to an rmmod/modprobe but with no USB
+	 * replug. csduo_init_device keeps its own failure backoff, so a recovery
+	 * that itself fails won't be retried on every single read.
+	 */
+	hid_dbg(priv->hdev, "poll failed (%d); re-initializing device\n", ret);
+	priv->initialized = false;
+	err = csduo_init_device(priv);
+	if (!err)
+		hid_info(priv->hdev,
+			 "recovered from failed poll (%d) by re-entering software mode\n",
+			 ret);
+	return err;
 }
 
 static int csduo_read_temp(struct csduo_data *priv, int channel, long *val)
@@ -474,7 +529,7 @@ static int csduo_read_fan(struct csduo_data *priv, int channel, long *val)
 static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 {
 	u8 cmd[14];
-	u8 duty_pct;
+	u8 duty_pct, write_err;
 	int data_len, total_len;
 	int ret, i;
 
@@ -521,7 +576,8 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 	/*
 	 * The device occasionally NAKs a PWM write (resp[RESP_ERR_OFF] != 0).
 	 * Retry briefly so a transient NAK doesn't bubble up as -EIO to
-	 * userspace.
+	 * userspace. Capture the write status before the trailing close,
+	 * whose reply overwrites priv->resp.
 	 */
 	for (i = 0; i < POLL_RETRY_COUNT; i++) {
 		ret = csduo_send_recv(priv, cmd, sizeof(cmd));
@@ -529,16 +585,18 @@ static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
 			break;
 		msleep(POLL_SLEEP_MS);
 	}
+	write_err = priv->resp[RESP_ERR_OFF];
 	msleep(POLL_SLEEP_MS);
 
 	csduo_close_endpoint(priv);
 
 	if (ret)
 		return ret;
-	if (priv->resp[RESP_ERR_OFF] != 0x00)
+	if (write_err != 0x00)
 		return -EIO;
 
-	priv->pwm_cache[channel] = (duty_pct * 255) / 100;
+	priv->pwm_cache[channel] = val;
+	priv->pwm_written[channel] = true;
 	return 0;
 }
 
@@ -742,10 +800,14 @@ static int csduo_raw_event(struct hid_device *hdev,
 	struct csduo_data *priv = hid_get_drvdata(hdev);
 	int n = min_t(int, size, PKT_LEN);
 
-	if (priv->drain_next) {
-		priv->drain_next = false;
+	/*
+	 * Responses echo the command opcode in byte 1. Drop reports that do
+	 * not match the in-flight command so a late reply to a timed-out
+	 * command cannot satisfy the next caller's wait and shift every
+	 * subsequent exchange off by one.
+	 */
+	if (size < 2 || data[1] != priv->expect_cmd)
 		return 0;
-	}
 
 	memset(priv->resp, 0, PKT_LEN);
 	memcpy(priv->resp, data, n);
