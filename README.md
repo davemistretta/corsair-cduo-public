@@ -10,47 +10,85 @@ Exposes fan RPM, temperature sensors, and per-channel PWM fan speed control via 
 - **Fan RPM** - `fan1_input`, `fan2_input`
 - **Independent PWM control** - `pwm1`, `pwm2` (0-255), each fan independently addressable
 - **Labels** - `temp1_label`, `fan1_label`, etc. for sensor identification
-- **Speed latching** - device holds commanded speed; no background polling required
-- **Self-healing** - if the device drops its software-mode session (seen after USB power-management events or long idle), the driver re-enters software mode automatically and restores commanded fan speeds
+- **Keepalive** - polls the device every 10s so it stays in software mode; the firmware otherwise reverts fans to its default speed after ~30-60s of host silence
+- **Self-healing** - if the device drops its software-mode session (seen after USB power-management events or idle), the driver re-enters software mode automatically on the next read or PWM write and restores commanded fan speeds
 - **Hardware mode restore** - device returns to default behavior on driver unload
 - Uses the CommanderCore protocol (same as [FanControl.CorsairLink](https://github.com/EvanMulawski/FanControl.CorsairLink))
 
 ## Requirements
 
 - Linux kernel 6.8+ (tested; likely works on 5.15+)
-- Kernel headers: `linux-headers-$(uname -r)`
+- Build tools, DKMS and kernel headers:
+
+  ```sh
+  sudo apt install build-essential dkms linux-headers-$(uname -r)
+  ```
 
 Tested on Ubuntu 24.04 and Ubuntu 26.04.
 
-## Build and Install
+## Install
+
+Install with DKMS. It rebuilds the driver automatically for every new kernel,
+so the driver keeps working across kernel updates.
+
+```sh
+git clone https://github.com/davemistretta/corsair-cduo-public.git
+cd corsair-cduo-public
+sudo dkms install .
+sudo modprobe corsair-cduo
+sensors
+```
+
+`sensors` should now list a `corsaircmdrduo` device. Nothing else is needed for
+the driver to load at boot: the kernel loads it automatically when it sees the
+device, so no `/etc/modules-load.d` entry is required.
+
+Check the install at any time with:
+
+```sh
+dkms status corsair-cduo
+```
+
+It should show `installed` for the running kernel.
+
+### Updating
+
+```sh
+git pull
+sudo dkms remove corsair-cduo/1.0 --all
+sudo dkms install .
+sudo modprobe -r corsair-cduo && sudo modprobe corsair-cduo
+```
+
+### Uninstalling
+
+```sh
+sudo modprobe -r corsair-cduo
+sudo dkms remove corsair-cduo/1.0 --all
+sudo rm -rf /usr/src/corsair-cduo-1.0
+```
+
+### Trying it without installing
+
+To build and load the driver once, without installing anything:
 
 ```sh
 make
 sudo insmod corsair-cduo.ko
-sensors
 ```
 
-To install permanently:
+This lasts until the next reboot. Run `make clean` afterwards if you then
+install with DKMS from the same directory.
 
-```sh
-sudo make install
-sudo depmod -a
-echo "corsair-cduo" | sudo tee /etc/modules-load.d/corsair-cduo.conf
-```
-
-Or use DKMS:
-
-```sh
-sudo cp -r . /usr/src/corsair-cduo-1.0/
-cat <<EOF | sudo tee /usr/src/corsair-cduo-1.0/dkms.conf
-PACKAGE_NAME="corsair-cduo"
-PACKAGE_VERSION="1.0"
-BUILT_MODULE_NAME[0]="corsair-cduo"
-DEST_MODULE_LOCATION[0]="/kernel/drivers/hid/"
-AUTOINSTALL="yes"
-EOF
-sudo dkms install corsair-cduo/1.0
-```
+> **Avoid `sudo make install` for a permanent install.** It installs the module
+> for the running kernel only, so the driver silently disappears at the next
+> kernel update. If you installed that way before, remove the old copy before
+> switching to DKMS:
+>
+> ```sh
+> sudo rm /lib/modules/$(uname -r)/updates/corsair-cduo.ko
+> sudo depmod -a
+> ```
 
 ## sysfs Interface
 
@@ -113,11 +151,18 @@ echo 128 | sudo tee $HWMON/pwm1
 echo 255 | sudo tee $HWMON/pwm2
 ```
 
-The device latches the commanded speed. It will hold the target until a new value is written or the driver is unloaded. Reading `pwm1`/`pwm2` returns exactly the last value written.
+The commanded speed holds until a new value is written or the driver is unloaded; the driver's 10-second keepalive keeps the device from timing out back to hardware mode. Reading `pwm1`/`pwm2` returns exactly the last value written — the device has no duty readback, so they read `0` until first written after the driver loads, regardless of how fast the fans are actually spinning.
 
 ## Troubleshooting
 
+- **`sensors` shows no `corsaircmdrduo` device** — work down this list:
+  - `dkms status corsair-cduo` — is the driver `installed` for the running kernel (`uname -r`)? If the kernel is missing, its headers were probably not installed when the kernel was; install `linux-headers-$(uname -r)` and run `sudo dkms autoinstall`.
+  - `lsmod | grep corsair_cduo` — is it loaded? If not, `sudo modprobe corsair-cduo`.
+  - `readlink -f /sys/bus/hid/devices/*1B1C:0C56*/driver` — one of the device's two interfaces should be bound to `corsair-cduo` (the other is left unbound). If it shows `hid-generic`, the driver is not loaded.
+  - `sudo dmesg | grep -i cduo` — probe errors.
+  - With Secure Boot enabled, the kernel rejects unsigned modules. DKMS on Ubuntu signs with a machine owner key (MOK) that must be enrolled; check with `mokutil --sb-state`.
 - **`recovered from failed poll (...) by re-entering software mode` in dmesg** — informational, not an error. The device intermittently drops its software-mode session (typically after USB power-management events or long idle); the driver detected it, recovered automatically, and restored any commanded fan speeds.
+- **`pwm1`/`pwm2` read 0 while fans spin** — expected until something writes them; see Usage.
 - **`fan1_input` or `fan2_input` reads 0** — often "fan present, but no tach wire." The driver logs each channel's tach status to dmesg once at first use (`fanN: status 0x03 (tach signal present)` / `0x01 (no tach signal)`).
 
 ## Protocol
