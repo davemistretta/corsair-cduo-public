@@ -37,7 +37,9 @@
  *   byte[3 + n*4]   = duty percent (0-100)
  *   byte[4 + n*4]   = 0x00
  *
- * The device latches commanded fan speeds; no continuous resend required.
+ * The device drops out of software mode (falling back to its hardware fan
+ * curve) if the host goes quiet for more than ~30s, so the driver polls on a
+ * keepalive timer once initialized.
  */
 
 #include <linux/delay.h>
@@ -48,6 +50,7 @@
 #include <linux/mutex.h>
 #include <linux/usb.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/unaligned.h>
 #else
@@ -79,6 +82,7 @@
 #define POLL_SLEEP_MS		50	/* ms between endpoint operations */
 #define INIT_SETTLE_MS		100	/* ms after entering software mode */
 #define INIT_RETRY_DELAY_MS	5000	/* ms before reattempting a failed init */
+#define KEEPALIVE_MS		10000	/* host-silence watchdog fires within ~36s */
 
 /* Response byte offsets */
 #define RESP_ERR_OFF		2
@@ -92,6 +96,7 @@ struct csduo_data {
 	struct device *hwmon_dev;
 	struct mutex lock;
 	struct completion wait_input;
+	struct delayed_work keepalive;
 	u8 expect_cmd;   /* opcode of the in-flight command; other reports dropped */
 	u8 *cmd_buffer;  /* DMA-safe heap buffer, OUT_BUF_LEN bytes */
 	u8 resp[PKT_LEN];
@@ -435,6 +440,9 @@ static int csduo_init_device(struct csduo_data *priv)
 	priv->init_last_fail = 0;
 	priv->initialized = true;
 
+	/* No-op if already queued (e.g. a self-heal from the keepalive itself). */
+	schedule_delayed_work(&priv->keepalive, msecs_to_jiffies(KEEPALIVE_MS));
+
 	/*
 	 * Re-entering software mode can reset the device's commanded duty
 	 * cycle. Restore any channel userspace has written so a self-heal
@@ -489,6 +497,29 @@ static int csduo_ensure_fresh(struct csduo_data *priv)
 	return err;
 }
 
+/*
+ * The device has a host-silence watchdog: after roughly 30-60s with no
+ * traffic it leaves software mode and runs the fans on its hardware curve,
+ * discarding any commanded duty. Poll periodically so the session (and the
+ * fan speeds userspace set) stays alive even when nothing reads sysfs.
+ * A poll failure self-heals through csduo_ensure_fresh / csduo_init_device,
+ * which also replays the commanded PWM values.
+ */
+static void csduo_keepalive_work(struct work_struct *work)
+{
+	struct csduo_data *priv = container_of(to_delayed_work(work),
+					       struct csduo_data, keepalive);
+
+	mutex_lock(&priv->lock);
+	if (priv->initialized)
+		csduo_ensure_fresh(priv);
+	else
+		csduo_init_device(priv);
+	mutex_unlock(&priv->lock);
+
+	schedule_delayed_work(&priv->keepalive, msecs_to_jiffies(KEEPALIVE_MS));
+}
+
 static int csduo_read_temp(struct csduo_data *priv, int channel, long *val)
 {
 	int ret;
@@ -522,8 +553,8 @@ static int csduo_read_fan(struct csduo_data *priv, int channel, long *val)
 /*
  * Fan speed control.
  * Uses CommanderCore per-channel write format via endpoint 0x18.
- * Each channel is independently addressable. The device latches the
- * commanded speed; no periodic resend is required.
+ * Each channel is independently addressable. The commanded speed holds only
+ * while the software-mode session does (see csduo_keepalive_work).
  */
 
 static int csduo_write_fan_pwm(struct csduo_data *priv, int channel, long val)
@@ -650,8 +681,22 @@ static int csduo_write(struct device *dev, enum hwmon_sensor_types type,
 			goto out_unlock;
 	}
 
-	if (type == hwmon_pwm && attr == hwmon_pwm_input && channel < NUM_FANS)
+	if (type == hwmon_pwm && attr == hwmon_pwm_input && channel < NUM_FANS) {
 		ret = csduo_write_fan_pwm(priv, channel, val);
+		if (ret == -EIO) {
+			/*
+			 * The device NAKs writes (error 0x03) once it has
+			 * dropped out of software mode. Re-enter it and retry
+			 * once, mirroring the self-heal on the read path.
+			 */
+			hid_dbg(priv->hdev, "pwm write NAKed; re-initializing device\n");
+			priv->initialized = false;
+			priv->init_last_fail = 0;
+			ret = csduo_init_device(priv);
+			if (!ret)
+				ret = csduo_write_fan_pwm(priv, channel, val);
+		}
+	}
 
 out_unlock:
 	mutex_unlock(&priv->lock);
@@ -742,6 +787,7 @@ static int csduo_probe(struct hid_device *hdev,
 	hid_set_drvdata(hdev, priv);
 	mutex_init(&priv->lock);
 	init_completion(&priv->wait_input);
+	INIT_DELAYED_WORK(&priv->keepalive, csduo_keepalive_work);
 
 	ret = hid_parse(hdev);
 	if (ret)
@@ -783,6 +829,7 @@ static void csduo_remove(struct hid_device *hdev)
 	static const u8 cmd[] = { 0x08, 0x01, 0x03, 0x00, 0x01 };
 
 	hwmon_device_unregister(priv->hwmon_dev);
+	cancel_delayed_work_sync(&priv->keepalive);
 
 	mutex_lock(&priv->lock);
 	if (priv->initialized)
