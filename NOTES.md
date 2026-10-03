@@ -73,7 +73,9 @@ Per-channel addressing:
 - `ch_id`: 0-based channel index
 - `duty%`: 0x00-0x64 (0-100%)
 - Linux hwmon uses 0-255; driver scales: `duty_pct = (val * 100) / 255`
-- The device latches the commanded speed; no continuous resend required.
+- The commanded speed holds only while the software-mode session is alive. The
+  device has a host-silence watchdog (see Known quirks), so the driver keeps
+  the session alive with a periodic poll.
 
 ### Sensor read cycle
 
@@ -96,7 +98,8 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 
 | Decision | Rationale |
 |---|---|
-| Lazy init | Device is not polled until first sensor read via sysfs |
+| Lazy init | Device is not polled until first sysfs access; the keepalive starts after the first successful init |
+| 10-second keepalive | `csduo_keepalive_work()` polls every 10s so the device's host-silence watchdog never fires and commanded fan speeds hold |
 | 1-second cache | `csduo_ensure_fresh()` skips polling if data is < 1s old |
 | Per-channel PWM | Each fan independently addressable via channel ID in write command |
 | Hardware mode on remove | `csduo_remove()` sends EnterHardwareMode so device returns to default behavior |
@@ -105,8 +108,9 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 | Response-to-command matching | Responses echo the command opcode in byte 1; `csduo_raw_event` drops any report whose opcode doesn't match the in-flight command, so a late reply to a timed-out command can't satisfy the next caller or shift subsequent exchanges off by one |
 | Parse before close | The read response is snapshotted before the trailing close command, whose reply overwrites the response buffer (see the buffer-echo quirk below) |
 | Self-heal on poll failure | `csduo_ensure_fresh()` re-enters software mode when a poll fails — transport error or parse failure (error byte / wrong dtype). A successful recovery logs at `hid_info` |
+| Self-heal on PWM write | A PWM write the device NAKs (dropped session) re-enters software mode and retries once, mirroring the read path |
 | PWM restore after re-init | Re-entering software mode can reset the device's commanded duty, so `csduo_init_device()` replays every userspace-written PWM channel after a successful (re-)init |
-| Exact PWM readback | `pwm1`/`pwm2` read back exactly the last value written (the 0–255 → percent conversion is not round-tripped) |
+| Exact PWM readback | `pwm1`/`pwm2` read back exactly the last value written (the 0–255 → percent conversion is not round-tripped). They read `0` until first written after load — this is not the device's actual duty |
 
 ### sysfs attributes (hwmon)
 
@@ -129,12 +133,16 @@ The driver reads fan RPM and temperature in separate cycles, with up to 5 retrie
 These are behaviors of the device/firmware, not of the driver. The driver
 handles all of them — none require user action.
 
-- **The device intermittently drops its software-mode session.**
-  Observed after USB power-management events and extended idle. In that state
-  the fan endpoint answers reads with error byte `0x03` and the wrong dtype,
-  so sensor reads would fail while PWM appears fine. **The driver recovers
-  automatically**: on a failed poll it re-enters software mode, re-polls, and
-  restores any commanded fan speeds. A successful recovery logs
+- **The device drops its software-mode session after ~30–60s of host silence.**
+  Confirmed on firmware 0.9.107: with no traffic for 36–56s the next command
+  gets error byte `0x03`, and the fans fall back to the hardware default speed,
+  discarding any commanded duty (fan1 went from ~530 back to ~1430 RPM while
+  `pwm1` still read 64). Also observed after USB power-management events. In
+  that state the fan endpoint answers reads with error `0x03` and the wrong
+  dtype, and PWM writes are NAKed with error `0x03`. **The driver handles it
+  two ways**: a 10-second keepalive poll prevents the timeout, and if the
+  session drops anyway, a failed poll *or* a NAKed PWM write re-enters
+  software mode and restores any commanded fan speeds. A successful recovery logs
   `recovered from failed poll (...) by re-entering software mode` to dmesg at
   info level. (This same session drop was the cause of historical "fan data
   disappears after repeated `rmmod`/`insmod`" symptoms — no USB replug is
@@ -172,6 +180,7 @@ handles all of them — none require user action.
 | 6.8.0-101-generic | Ubuntu 24.04 (GA) | All features working¹ |
 | 6.17.0-29-generic | Ubuntu 24.04 (HWE) | All features working¹ |
 | 7.0.0-27-generic | Ubuntu 26.04 | All features working, including the self-heal/hardening revision (live-validated on hardware) |
+| 7.0.0-38-generic | Ubuntu 26.04 | Firmware 0.9.107: idle watchdog found; keepalive + write-path recovery added |
 
 ¹ Tested at an earlier driver revision (before the self-heal and protocol
 hardening changes). Those changes introduce no new kernel API usage, so the
